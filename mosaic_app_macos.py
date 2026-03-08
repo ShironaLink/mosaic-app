@@ -21,7 +21,7 @@ from AppKit import (
 )
 import Foundation
 from Foundation import NSObject, NSMakePoint, NSData, NSURL, NSBundle
-from PIL import Image
+from PIL import Image, ImageDraw
 import io
 import os
 import sys
@@ -53,7 +53,7 @@ class MosaicCanvasView(NSView):
         self._display_image = None   # NSImage
         self._pil_image = None       # PIL Image (フル解像度の編集用)
         self._undo_stack = []
-        self._mode = "brush"         # "brush" or "rect"
+        self._mode = "brush"         # "brush", "rect", "crop_rect", "crop_circle"
         self._block_size = 15
         self._brush_size = 30
         self._drag_start = None
@@ -68,13 +68,17 @@ class MosaicCanvasView(NSView):
         self._pan_start_y = 0.0
         self._pan_offset_start_x = 0.0
         self._pan_offset_start_y = 0.0
+        # ブラシプレビュー用マウス位置
+        self._mouse_x = -1000.0
+        self._mouse_y = -1000.0
+        self._mouse_in_view = False
         self._setup_tracking()
         return self
 
     def _setup_tracking(self):
         ta = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
             self.bounds(),
-            NSTrackingMouseMoved | NSTrackingActiveInActiveApp | NSTrackingInVisibleRect,
+            NSTrackingMouseMoved | NSTrackingActiveInActiveApp | NSTrackingInVisibleRect | NSTrackingMouseEnteredAndExited,
             self, None
         )
         self.addTrackingArea_(ta)
@@ -118,6 +122,10 @@ class MosaicCanvasView(NSView):
 
     def drawRect_(self, rect):
         try:
+            # クリッピング - キャンバス領域外への描画を防止
+            NSGraphicsContext.currentContext().saveGraphicsState()
+            NSBezierPath.clipRect_(self.bounds())
+
             # 背景
             NSColor.colorWithCalibratedRed_green_blue_alpha_(0.17, 0.17, 0.17, 1.0).set()
             NSBezierPath.fillRect_(self.bounds())
@@ -138,9 +146,10 @@ class MosaicCanvasView(NSView):
                 x = (bounds.size.width - size.width) / 2
                 y = (bounds.size.height - size.height) / 2
                 ns_str.drawAtPoint_withAttributes_(NSMakePoint(x, y), attrs)
+                NSGraphicsContext.currentContext().restoreGraphicsState()
                 return
 
-            img_rect, _ = self._image_rect()
+            img_rect, effective_scale = self._image_rect()
             # isFlippedビューではNSImageが上下反転するため、変換で補正
             NSGraphicsContext.currentContext().saveGraphicsState()
             xf = NSAffineTransform.transform()
@@ -156,20 +165,50 @@ class MosaicCanvasView(NSView):
             )
             NSGraphicsContext.currentContext().restoreGraphicsState()
 
-            # 範囲選択中の矩形を描画
-            if self._mode == "rect" and self._drag_start and self._drag_current:
+            # 範囲選択中のプレビュー描画
+            if self._drag_start and self._drag_current:
                 x0, y0 = self._drag_start
                 x1, y1 = self._drag_current
                 rx = min(x0, x1)
                 ry = min(y0, y1)
                 rw = abs(x1 - x0)
                 rh = abs(y1 - y0)
-                NSColor.redColor().set()
-                path = NSBezierPath.bezierPathWithRect_(NSMakeRect(rx, ry, rw, rh))
-                path.setLineWidth_(2.0)
-                pattern = [4.0, 4.0]
-                path.setLineDash_count_phase_(pattern, 2, 0)
-                path.stroke()
+
+                if self._mode == "crop_circle":
+                    # 円形トリミングプレビュー（シアン色の楕円）
+                    NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.8, 1.0, 0.8).set()
+                    path = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(rx, ry, rw, rh))
+                    path.setLineWidth_(2.0)
+                    pattern = [6.0, 4.0]
+                    path.setLineDash_count_phase_(pattern, 2, 0)
+                    path.stroke()
+                elif self._mode in ("rect", "crop_rect"):
+                    # 矩形プレビュー
+                    if self._mode == "crop_rect":
+                        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 1.0, 0.3, 0.8).set()
+                    else:
+                        NSColor.redColor().set()
+                    path = NSBezierPath.bezierPathWithRect_(NSMakeRect(rx, ry, rw, rh))
+                    path.setLineWidth_(2.0)
+                    pattern = [4.0, 4.0]
+                    path.setLineDash_count_phase_(pattern, 2, 0)
+                    path.stroke()
+
+            # ブラシカーソルプレビュー（黄色い円）
+            if self._mode == "brush" and self._mouse_in_view and self._pil_image:
+                view_brush_size = self._brush_size * effective_scale
+                half = view_brush_size / 2.0
+                cx = self._mouse_x - half
+                cy = self._mouse_y - half
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 1.0, 0.0, 0.7).set()
+                circle = NSBezierPath.bezierPathWithOvalInRect_(
+                    NSMakeRect(cx, cy, view_brush_size, view_brush_size)
+                )
+                circle.setLineWidth_(1.5)
+                circle.stroke()
+
+            # 外側のクリッピング状態を復元
+            NSGraphicsContext.currentContext().restoreGraphicsState()
         except Exception as e:
             import sys
             print(f"drawRect_ error: {e}", file=sys.stderr)
@@ -183,13 +222,31 @@ class MosaicCanvasView(NSView):
         iy = int((vy - img_rect.origin.y) / scale)
         return ix, iy
 
+    def mouseMoved_(self, event):
+        """マウス移動時にブラシプレビュー更新"""
+        loc = self.convertPoint_fromView_(event.locationInWindow(), None)
+        self._mouse_x = loc.x
+        self._mouse_y = loc.y
+        if self._mode == "brush" and self._pil_image:
+            self.setNeedsDisplay_(True)
+
+    def mouseEntered_(self, event):
+        self._mouse_in_view = True
+        if self._mode == "brush":
+            self.setNeedsDisplay_(True)
+
+    def mouseExited_(self, event):
+        self._mouse_in_view = False
+        if self._mode == "brush":
+            self.setNeedsDisplay_(True)
+
     def mouseDown_(self, event):
         if self._pil_image is None:
             return
         loc = self.convertPoint_fromView_(event.locationInWindow(), None)
         vx, vy = loc.x, loc.y
 
-        if self._mode == "rect":
+        if self._mode in ("rect", "crop_rect", "crop_circle"):
             self._drag_start = (vx, vy)
             self._drag_current = (vx, vy)
         else:
@@ -202,8 +259,11 @@ class MosaicCanvasView(NSView):
             return
         loc = self.convertPoint_fromView_(event.locationInWindow(), None)
         vx, vy = loc.x, loc.y
+        # ブラシプレビュー位置も更新
+        self._mouse_x = vx
+        self._mouse_y = vy
 
-        if self._mode == "rect":
+        if self._mode in ("rect", "crop_rect", "crop_circle"):
             self._drag_current = (vx, vy)
             self.setNeedsDisplay_(True)
         else:
@@ -213,7 +273,7 @@ class MosaicCanvasView(NSView):
     def mouseUp_(self, event):
         if self._pil_image is None:
             return
-        if self._mode == "rect" and self._drag_start:
+        if self._mode in ("rect", "crop_rect", "crop_circle") and self._drag_start:
             loc = self.convertPoint_fromView_(event.locationInWindow(), None)
             ix0, iy0 = self._view_to_image(*self._drag_start)
             ix1, iy1 = self._view_to_image(loc.x, loc.y)
@@ -221,7 +281,12 @@ class MosaicCanvasView(NSView):
             ly, ry = min(iy0, iy1), max(iy0, iy1)
             if rx - lx > 2 and ry - ly > 2:
                 self._push_undo()
-                self._apply_mosaic(lx, ly, rx, ry)
+                if self._mode == "rect":
+                    self._apply_mosaic(lx, ly, rx, ry)
+                elif self._mode == "crop_rect":
+                    self._apply_rect_crop(lx, ly, rx, ry)
+                elif self._mode == "crop_circle":
+                    self._apply_circle_crop(lx, ly, rx, ry)
             self._drag_start = None
             self._drag_current = None
             self.setNeedsDisplay_(True)
@@ -343,6 +408,51 @@ class MosaicCanvasView(NSView):
         half = max(5, self._brush_size) // 2
         self._apply_mosaic(cx - half, cy - half, cx + half, cy + half)
 
+    def _apply_rect_crop(self, x0, y0, x1, y1):
+        """四角トリミング"""
+        iw, ih = self._pil_image.size
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(iw, x1)
+        y1 = min(ih, y1)
+        if x1 - x0 > 2 and y1 - y0 > 2:
+            self._pil_image = self._pil_image.crop((x0, y0, x1, y1))
+            self._zoom_scale = 1.0
+            self._pan_offset_x = 0.0
+            self._pan_offset_y = 0.0
+            self._update_display()
+            self._update_status()
+            if self._delegate and hasattr(self._delegate, '_status_label'):
+                w, h = self._pil_image.size
+                self._delegate._status_label.setStringValue_(
+                    f"トリミング完了  ({w} x {h})  |  ズーム: 100%")
+
+    def _apply_circle_crop(self, x0, y0, x1, y1):
+        """円形トリミング"""
+        iw, ih = self._pil_image.size
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(iw, x1)
+        y1 = min(ih, y1)
+        if x1 - x0 > 2 and y1 - y0 > 2:
+            region = self._pil_image.crop((x0, y0, x1, y1))
+            rw, rh = region.size
+            # RGBA に変換して円形マスクを適用
+            result = region.convert("RGBA")
+            mask = Image.new("L", (rw, rh), 0)
+            draw = ImageDraw.Draw(mask)
+            draw.ellipse((0, 0, rw - 1, rh - 1), fill=255)
+            result.putalpha(mask)
+            self._pil_image = result
+            self._zoom_scale = 1.0
+            self._pan_offset_x = 0.0
+            self._pan_offset_y = 0.0
+            self._update_display()
+            self._update_status()
+            if self._delegate and hasattr(self._delegate, '_status_label'):
+                self._delegate._status_label.setStringValue_(
+                    f"円形トリミング完了  ({rw} x {rh})  |  ズーム: 100%")
+
     # ドラッグ&ドロップ対応
     def draggingEntered_(self, sender):
         return 1  # NSDragOperationCopy
@@ -378,6 +488,8 @@ class AppDelegate(NSObject):
         self._window = None
         self._mode_brush_btn = None
         self._mode_rect_btn = None
+        self._mode_crop_rect_btn = None
+        self._mode_crop_circle_btn = None
         return self
 
     def applicationDidFinishLaunching_(self, notification):
@@ -447,15 +559,17 @@ class AppDelegate(NSObject):
         cw = content_bounds.size.width
         ch = content_bounds.size.height
 
-        # --- ツールバー (上部) ---
-        toolbar_h = 40
+        # --- ツールバー (上部・2段) ---
+        toolbar_h = 72
         toolbar_y = ch - toolbar_h
         toolbar = NSView.alloc().initWithFrame_(NSMakeRect(0, toolbar_y, cw, toolbar_h))
         toolbar.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
 
+        # --- 上段 (y=37): ファイル操作 + モード選択 ---
+        row1_y = 37
         x = 10
-        # 画像を開くボタン
-        btn_open = NSButton.alloc().initWithFrame_(NSMakeRect(x, 5, 100, 30))
+
+        btn_open = NSButton.alloc().initWithFrame_(NSMakeRect(x, row1_y, 100, 30))
         btn_open.setTitle_("画像を開く")
         btn_open.setBezelStyle_(NSBezelStyleRounded)
         btn_open.setTarget_(self)
@@ -463,7 +577,7 @@ class AppDelegate(NSObject):
         toolbar.addSubview_(btn_open)
         x += 108
 
-        btn_save = NSButton.alloc().initWithFrame_(NSMakeRect(x, 5, 60, 30))
+        btn_save = NSButton.alloc().initWithFrame_(NSMakeRect(x, row1_y, 60, 30))
         btn_save.setTitle_("保存")
         btn_save.setBezelStyle_(NSBezelStyleRounded)
         btn_save.setTarget_(self)
@@ -471,21 +585,23 @@ class AppDelegate(NSObject):
         toolbar.addSubview_(btn_save)
         x += 68
 
-        btn_undo = NSButton.alloc().initWithFrame_(NSMakeRect(x, 5, 80, 30))
+        btn_undo = NSButton.alloc().initWithFrame_(NSMakeRect(x, row1_y, 80, 30))
         btn_undo.setTitle_("元に戻す")
         btn_undo.setBezelStyle_(NSBezelStyleRounded)
         btn_undo.setTarget_(self)
         btn_undo.setAction_("undoAction:")
         toolbar.addSubview_(btn_undo)
-        x += 100
+        x += 95
 
-        # モード: ブラシ
+        # セパレータ
+        x += 10
+
         lbl_mode = NSTextField.labelWithString_("モード:")
-        lbl_mode.setFrame_(NSMakeRect(x, 10, 50, 20))
+        lbl_mode.setFrame_(NSMakeRect(x, row1_y + 5, 50, 20))
         toolbar.addSubview_(lbl_mode)
         x += 55
 
-        self._mode_brush_btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, 5, 70, 30))
+        self._mode_brush_btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, row1_y, 70, 30))
         self._mode_brush_btn.setTitle_("ブラシ")
         self._mode_brush_btn.setButtonType_(NSRadioButton)
         self._mode_brush_btn.setState_(NSOnState)
@@ -494,52 +610,71 @@ class AppDelegate(NSObject):
         toolbar.addSubview_(self._mode_brush_btn)
         x += 75
 
-        self._mode_rect_btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, 5, 80, 30))
+        self._mode_rect_btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, row1_y, 80, 30))
         self._mode_rect_btn.setTitle_("範囲選択")
         self._mode_rect_btn.setButtonType_(NSRadioButton)
         self._mode_rect_btn.setState_(NSOffState)
         self._mode_rect_btn.setTarget_(self)
         self._mode_rect_btn.setAction_("setModeRect:")
         toolbar.addSubview_(self._mode_rect_btn)
-        x += 95
+        x += 85
 
-        # モザイク強度スライダー
+        self._mode_crop_rect_btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, row1_y, 100, 30))
+        self._mode_crop_rect_btn.setTitle_("□ トリミング")
+        self._mode_crop_rect_btn.setButtonType_(NSRadioButton)
+        self._mode_crop_rect_btn.setState_(NSOffState)
+        self._mode_crop_rect_btn.setTarget_(self)
+        self._mode_crop_rect_btn.setAction_("setModeCropRect:")
+        toolbar.addSubview_(self._mode_crop_rect_btn)
+        x += 105
+
+        self._mode_crop_circle_btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, row1_y, 100, 30))
+        self._mode_crop_circle_btn.setTitle_("○ トリミング")
+        self._mode_crop_circle_btn.setButtonType_(NSRadioButton)
+        self._mode_crop_circle_btn.setState_(NSOffState)
+        self._mode_crop_circle_btn.setTarget_(self)
+        self._mode_crop_circle_btn.setAction_("setModeCropCircle:")
+        toolbar.addSubview_(self._mode_crop_circle_btn)
+
+        # --- 下段 (y=5): スライダー ---
+        row2_y = 5
+        x = 10
+
         lbl_block = NSTextField.labelWithString_("強度:")
-        lbl_block.setFrame_(NSMakeRect(x, 10, 40, 20))
+        lbl_block.setFrame_(NSMakeRect(x, row2_y + 5, 40, 20))
         toolbar.addSubview_(lbl_block)
         x += 42
 
-        self._block_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(x, 8, 100, 24))
+        self._block_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(x, row2_y + 3, 120, 24))
         self._block_slider.setMinValue_(2)
         self._block_slider.setMaxValue_(50)
         self._block_slider.setIntValue_(15)
         self._block_slider.setTarget_(self)
         self._block_slider.setAction_("blockSizeChanged:")
         toolbar.addSubview_(self._block_slider)
-        x += 105
+        x += 125
 
         self._block_label = NSTextField.labelWithString_("15px")
-        self._block_label.setFrame_(NSMakeRect(x, 10, 40, 20))
+        self._block_label.setFrame_(NSMakeRect(x, row2_y + 5, 40, 20))
         toolbar.addSubview_(self._block_label)
-        x += 48
+        x += 55
 
-        # ブラシサイズスライダー
         lbl_brush = NSTextField.labelWithString_("ブラシ:")
-        lbl_brush.setFrame_(NSMakeRect(x, 10, 45, 20))
+        lbl_brush.setFrame_(NSMakeRect(x, row2_y + 5, 50, 20))
         toolbar.addSubview_(lbl_brush)
-        x += 48
+        x += 52
 
-        self._brush_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(x, 8, 100, 24))
+        self._brush_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(x, row2_y + 3, 120, 24))
         self._brush_slider.setMinValue_(10)
         self._brush_slider.setMaxValue_(100)
         self._brush_slider.setIntValue_(30)
         self._brush_slider.setTarget_(self)
         self._brush_slider.setAction_("brushSizeChanged:")
         toolbar.addSubview_(self._brush_slider)
-        x += 105
+        x += 125
 
         self._brush_label = NSTextField.labelWithString_("30px")
-        self._brush_label.setFrame_(NSMakeRect(x, 10, 40, 20))
+        self._brush_label.setFrame_(NSMakeRect(x, row2_y + 5, 40, 20))
         toolbar.addSubview_(self._brush_label)
 
         content.addSubview_(toolbar)
@@ -595,7 +730,16 @@ class AppDelegate(NSObject):
             url = panel.URL()
             if url:
                 path = url.path()
-                self._canvas._pil_image.save(path)
+                img = self._canvas._pil_image
+                # JPEG保存時はRGBに変換（透明度非対応）
+                ext = os.path.splitext(path)[1].lower()
+                if ext in (".jpg", ".jpeg", ".bmp") and img.mode == "RGBA":
+                    # 白背景で合成してRGBに変換
+                    bg = Image.new("RGB", img.size, (255, 255, 255))
+                    bg.paste(img, mask=img.split()[3])
+                    bg.save(path)
+                else:
+                    img.save(path)
                 self._status_label.setStringValue_(f"保存しました: {os.path.basename(path)}")
 
     @objc.IBAction
@@ -605,17 +749,36 @@ class AppDelegate(NSObject):
         else:
             self._status_label.setStringValue_("これ以上戻せません")
 
+    def _set_all_mode_buttons_off(self):
+        """全モードボタンをOFFにする"""
+        self._mode_brush_btn.setState_(NSOffState)
+        self._mode_rect_btn.setState_(NSOffState)
+        self._mode_crop_rect_btn.setState_(NSOffState)
+        self._mode_crop_circle_btn.setState_(NSOffState)
+
     @objc.IBAction
     def setModeBrush_(self, sender):
         self._canvas._mode = "brush"
+        self._set_all_mode_buttons_off()
         self._mode_brush_btn.setState_(NSOnState)
-        self._mode_rect_btn.setState_(NSOffState)
 
     @objc.IBAction
     def setModeRect_(self, sender):
         self._canvas._mode = "rect"
-        self._mode_brush_btn.setState_(NSOffState)
+        self._set_all_mode_buttons_off()
         self._mode_rect_btn.setState_(NSOnState)
+
+    @objc.IBAction
+    def setModeCropRect_(self, sender):
+        self._canvas._mode = "crop_rect"
+        self._set_all_mode_buttons_off()
+        self._mode_crop_rect_btn.setState_(NSOnState)
+
+    @objc.IBAction
+    def setModeCropCircle_(self, sender):
+        self._canvas._mode = "crop_circle"
+        self._set_all_mode_buttons_off()
+        self._mode_crop_circle_btn.setState_(NSOnState)
 
     @objc.IBAction
     def blockSizeChanged_(self, sender):
