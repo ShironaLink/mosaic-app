@@ -36,6 +36,14 @@ class MosaicCanvas(tk.Canvas):
         self._drag_start = None
         self._drag_current = None
 
+        # トリミング選択範囲（画像ピクセル座標で保持）
+        self._crop_selection = None          # (x0, y0, x1, y1) or None
+        self._crop_mode_for_selection = None  # "crop_rect" or "crop_circle"
+        # 選択範囲の移動用
+        self._is_moving_selection = False
+        self._move_start_ix = 0
+        self._move_start_iy = 0
+
         # パン用
         self._is_panning = False
         self._pan_start_x = 0.0
@@ -107,6 +115,9 @@ class MosaicCanvas(tk.Canvas):
         display_img = self._pil_image.resize((disp_w, disp_h), Image.NEAREST)
         self._photo_image = ImageTk.PhotoImage(display_img)
         self.create_image(x, y, image=self._photo_image, anchor=tk.NW, tags="image")
+        # クロップ選択があれば再描画
+        if self._crop_selection:
+            self._draw_crop_selection()
 
     def _view_to_image(self, vx, vy):
         """Canvas座標 → 画像ピクセル座標"""
@@ -119,12 +130,30 @@ class MosaicCanvas(tk.Canvas):
 
     # --- マウスイベント ---
 
+    def _is_point_in_crop_selection(self, ix, iy):
+        """画像座標がクロップ選択内かどうか"""
+        if self._crop_selection is None:
+            return False
+        sx0, sy0, sx1, sy1 = self._crop_selection
+        return sx0 <= ix <= sx1 and sy0 <= iy <= sy1
+
     def _on_mouse_down(self, event):
         if self._pil_image is None:
             return
         mode = self._mode_var.get() if self._mode_var else "brush"
         ix, iy = self._view_to_image(event.x, event.y)
-        if mode == "rect":
+        if mode in ("rect", "crop_rect", "crop_circle"):
+            if mode in ("crop_rect", "crop_circle") and self._crop_selection:
+                # 既存の選択範囲内をクリック → 移動モード
+                if self._is_point_in_crop_selection(ix, iy):
+                    self._is_moving_selection = True
+                    self._move_start_ix = ix
+                    self._move_start_iy = iy
+                    return
+            # 新しいドラッグで古いクロップ選択をクリア
+            if mode in ("crop_rect", "crop_circle"):
+                self._crop_selection = None
+                self._app._update_crop_button()
             self._drag_start = (event.x, event.y)
             self._drag_current = (event.x, event.y)
         elif mode == "brush":
@@ -140,41 +169,128 @@ class MosaicCanvas(tk.Canvas):
         if self._pil_image is None:
             return
         mode = self._mode_var.get() if self._mode_var else "brush"
-        ix, iy = self._view_to_image(event.x, event.y)
-        if mode == "rect":
-            self._drag_current = (event.x, event.y)
+        vx, vy = event.x, event.y
+
+        # 選択範囲の移動
+        if self._is_moving_selection and self._crop_selection:
+            ix, iy = self._view_to_image(vx, vy)
+            dx = ix - self._move_start_ix
+            dy = iy - self._move_start_iy
+            sx0, sy0, sx1, sy1 = self._crop_selection
+            iw, ih = self._pil_image.size
+            sw, sh = sx1 - sx0, sy1 - sy0
+            nx0 = max(0, min(iw - sw, sx0 + dx))
+            ny0 = max(0, min(ih - sh, sy0 + dy))
+            self._crop_selection = (nx0, ny0, nx0 + sw, ny0 + sh)
+            self._move_start_ix = ix
+            self._move_start_iy = iy
+            mode_name = "□" if self._crop_mode_for_selection == "crop_rect" else "○"
+            self._app._status_var.set(
+                f"{mode_name} 移動中: {sw} x {sh}  |  「切り取り」ボタンで実行")
+            self._draw_crop_selection()
+            return
+
+        if mode in ("rect", "crop_rect", "crop_circle"):
+            # Ctrl押しで正方形/正円に制約
+            if self._drag_start and (event.state & 0x4):  # Ctrl key
+                sx, sy = self._drag_start
+                dx = vx - sx
+                dy = vy - sy
+                size = max(abs(dx), abs(dy))
+                vx = sx + (size if dx >= 0 else -size)
+                vy = sy + (size if dy >= 0 else -size)
+            self._drag_current = (vx, vy)
             self._draw_selection_rect()
         elif mode == "brush":
+            ix, iy = self._view_to_image(vx, vy)
             self._apply_brush(ix, iy)
         elif mode == "eyedropper":
+            ix, iy = self._view_to_image(vx, vy)
             self._pick_color(ix, iy)
         elif mode == "paint":
+            ix, iy = self._view_to_image(vx, vy)
             self._apply_paint_brush(ix, iy)
 
     def _on_mouse_up(self, event):
         if self._pil_image is None:
             return
+        # 移動モード終了
+        if self._is_moving_selection:
+            self._is_moving_selection = False
+            if self._crop_selection:
+                sx0, sy0, sx1, sy1 = self._crop_selection
+                w, h = sx1 - sx0, sy1 - sy0
+                mode_name = "□" if self._crop_mode_for_selection == "crop_rect" else "○"
+                self._app._status_var.set(
+                    f"{mode_name} 選択中: {w} x {h}  |  「切り取り」ボタンで実行")
+            return
         mode = self._mode_var.get() if self._mode_var else "brush"
-        if mode == "rect" and self._drag_start:
+        if mode in ("rect", "crop_rect", "crop_circle") and self._drag_start:
             ix0, iy0 = self._view_to_image(*self._drag_start)
             ix1, iy1 = self._view_to_image(event.x, event.y)
             lx, rx = min(ix0, ix1), max(ix0, ix1)
             ly, ry = min(iy0, iy1), max(iy0, iy1)
             if rx - lx > 2 and ry - ly > 2:
-                self._push_undo()
-                self._apply_mosaic(lx, ly, rx, ry)
+                if mode == "rect":
+                    self._push_undo()
+                    self._apply_mosaic(lx, ly, rx, ry)
+                elif mode in ("crop_rect", "crop_circle"):
+                    # トリミングは選択のみ保持（「切り取り」ボタンで実行）
+                    self._crop_selection = (lx, ly, rx, ry)
+                    self._crop_mode_for_selection = mode
+                    w, h = rx - lx, ry - ly
+                    mode_name = "□" if mode == "crop_rect" else "○"
+                    self._app._status_var.set(
+                        f"{mode_name} 選択中: {w} x {h}  |  「切り取り」ボタンで実行")
+                    self._app._update_crop_button()
             self._drag_start = None
             self._drag_current = None
             self.delete("selection")
+            if mode in ("crop_rect", "crop_circle"):
+                self._draw_crop_selection()
 
     def _draw_selection_rect(self):
         self.delete("selection")
         if self._drag_start and self._drag_current:
             x0, y0 = self._drag_start
             x1, y1 = self._drag_current
+            mode = self._mode_var.get() if self._mode_var else "brush"
+            if mode == "crop_circle":
+                self.create_oval(
+                    x0, y0, x1, y1,
+                    outline="cyan", width=2, dash=(4, 4), tags="selection"
+                )
+            elif mode == "crop_rect":
+                self.create_rectangle(
+                    x0, y0, x1, y1,
+                    outline="#00ff4d", width=2, dash=(4, 4), tags="selection"
+                )
+            else:
+                self.create_rectangle(
+                    x0, y0, x1, y1,
+                    outline="red", width=2, dash=(4, 4), tags="selection"
+                )
+
+    def _draw_crop_selection(self):
+        """確定済みクロップ選択範囲を描画"""
+        self.delete("crop_sel")
+        if self._crop_selection is None:
+            return
+        sx0, sy0, sx1, sy1 = self._crop_selection
+        x, y, _, _, scale = self._get_image_rect()
+        vx0 = x + sx0 * scale
+        vy0 = y + sy0 * scale
+        vx1 = x + sx1 * scale
+        vy1 = y + sy1 * scale
+        if self._crop_mode_for_selection == "crop_circle":
+            self.create_oval(
+                vx0, vy0, vx1, vy1,
+                outline="cyan", width=2, dash=(4, 4), tags="crop_sel"
+            )
+        else:
             self.create_rectangle(
-                x0, y0, x1, y1,
-                outline="red", width=2, dash=(4, 4), tags="selection"
+                vx0, vy0, vx1, vy1,
+                outline="#00ff4d", width=2, dash=(4, 4), tags="crop_sel"
             )
 
     # --- ズーム ---
@@ -312,6 +428,70 @@ class MosaicCanvas(tk.Canvas):
         )
         self._update_display()
 
+    # --- トリミング ---
+
+    def apply_crop(self):
+        """保持されたクロップ選択を実行"""
+        if self._crop_selection is None:
+            return False
+        x0, y0, x1, y1 = self._crop_selection
+        mode = self._crop_mode_for_selection
+        self._push_undo()
+        if mode == "crop_rect":
+            self._apply_rect_crop(x0, y0, x1, y1)
+        elif mode == "crop_circle":
+            self._apply_circle_crop(x0, y0, x1, y1)
+        self._crop_selection = None
+        self._crop_mode_for_selection = None
+        self.delete("crop_sel")
+        return True
+
+    def clear_crop_selection(self):
+        """クロップ選択をクリア"""
+        self._crop_selection = None
+        self._crop_mode_for_selection = None
+        self.delete("crop_sel")
+
+    def _apply_rect_crop(self, x0, y0, x1, y1):
+        """四角トリミング"""
+        iw, ih = self._pil_image.size
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(iw, x1)
+        y1 = min(ih, y1)
+        if x1 - x0 > 2 and y1 - y0 > 2:
+            self._pil_image = self._pil_image.crop((x0, y0, x1, y1))
+            self._zoom_scale = 1.0
+            self._pan_offset_x = 0.0
+            self._pan_offset_y = 0.0
+            self._update_display()
+            w, h = self._pil_image.size
+            self._app._status_var.set(
+                f"トリミング完了  ({w} x {h})  |  ズーム: 100%")
+
+    def _apply_circle_crop(self, x0, y0, x1, y1):
+        """円形トリミング"""
+        iw, ih = self._pil_image.size
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(iw, x1)
+        y1 = min(ih, y1)
+        if x1 - x0 > 2 and y1 - y0 > 2:
+            region = self._pil_image.crop((x0, y0, x1, y1))
+            rw, rh = region.size
+            result = region.convert("RGBA")
+            mask = Image.new("L", (rw, rh), 0)
+            draw = ImageDraw.Draw(mask)
+            draw.ellipse((0, 0, rw - 1, rh - 1), fill=255)
+            result.putalpha(mask)
+            self._pil_image = result
+            self._zoom_scale = 1.0
+            self._pan_offset_x = 0.0
+            self._pan_offset_y = 0.0
+            self._update_display()
+            self._app._status_var.set(
+                f"円形トリミング完了  ({rw} x {rh})  |  ズーム: 100%")
+
 
 class MosaicApp(tk.Tk):
     """メインウィンドウ"""
@@ -391,6 +571,16 @@ class MosaicApp(tk.Tk):
         ttk.Radiobutton(
             toolbar, text="ペイント", variable=self._mode_var, value="paint"
         ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            toolbar, text="□トリミング", variable=self._mode_var, value="crop_rect"
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            toolbar, text="○トリミング", variable=self._mode_var, value="crop_circle"
+        ).pack(side=tk.LEFT)
+
+        self._btn_crop = ttk.Button(toolbar, text="切り取り", command=self._do_crop,
+                                     state=tk.DISABLED)
+        self._btn_crop.pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
             side=tk.LEFT, fill=tk.Y, padx=6, pady=2
@@ -477,8 +667,27 @@ class MosaicApp(tk.Tk):
             "rect": "crosshair",
             "eyedropper": "tcross",
             "paint": "circle",
+            "crop_rect": "crosshair",
+            "crop_circle": "crosshair",
         }
         self._canvas.configure(cursor=cursors.get(mode, "arrow"))
+        # トリミング以外のモードに切り替えたらクロップ選択をクリア
+        if mode not in ("crop_rect", "crop_circle"):
+            self._canvas.clear_crop_selection()
+            self._update_crop_button()
+
+    def _do_crop(self):
+        """切り取りボタンの実行"""
+        if self._canvas.apply_crop():
+            self._update_crop_button()
+
+    def _update_crop_button(self):
+        """切り取りボタンの有効/無効を更新"""
+        if hasattr(self, '_btn_crop'):
+            if self._canvas._crop_selection is not None:
+                self._btn_crop.config(state=tk.NORMAL)
+            else:
+                self._btn_crop.config(state=tk.DISABLED)
 
     def _on_swatch_click(self, event=None):
         """カラースウォッチクリック → カラーチューザーで色を手動選択"""
