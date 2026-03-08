@@ -523,22 +523,153 @@ class MosaicApp(tk.Tk):
         if path:
             self.load_image(path)
 
+    def _estimate_file_size(self, width, height, fmt):
+        """フォーマットとサイズから推定ファイルサイズを計算"""
+        pixels = width * height
+        rates = {
+            "png": 2.5, "jpg": 0.4, "gif": 0.8,
+            "bmp": 3.0, "tiff": 4.0, "webp": 0.25
+        }
+        estimated = int(pixels * rates.get(fmt, 2.5))
+        if estimated < 1024:
+            return f"{estimated} B"
+        elif estimated < 1024 * 1024:
+            return f"{estimated / 1024:.0f} KB"
+        else:
+            return f"{estimated / (1024 * 1024):.1f} MB"
+
     def save_file(self):
         if self._canvas._pil_image is None:
             return
-        path = filedialog.asksaveasfilename(
-            title="画像を保存",
-            defaultextension=".png",
-            initialfile="mosaic_image.png",
-            filetypes=[
-                ("PNG", "*.png"),
-                ("JPEG", "*.jpg"),
-                ("BMP", "*.bmp"),
+        img = self._canvas._pil_image
+        iw, ih = img.size
+
+        # 保存オプションダイアログ
+        dlg = tk.Toplevel(self)
+        dlg.title("保存オプション")
+        dlg.geometry("380x200")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        # フォーマット選択
+        ttk.Label(dlg, text="フォーマット:").place(x=20, y=20)
+        fmt_var = tk.StringVar(value="PNG")
+        fmt_combo = ttk.Combobox(dlg, textvariable=fmt_var, state="readonly",
+                                 values=["PNG", "JPEG", "GIF", "BMP", "TIFF", "WebP"],
+                                 width=15)
+        fmt_combo.place(x=120, y=20)
+
+        # サイズスライダー
+        ttk.Label(dlg, text="サイズ:").place(x=20, y=60)
+        size_var = tk.IntVar(value=100)
+        size_slider = ttk.Scale(dlg, from_=10, to=200, variable=size_var,
+                                orient=tk.HORIZONTAL, length=160)
+        size_slider.place(x=120, y=58)
+        size_label = ttk.Label(dlg, text=f"100% ({iw}x{ih})")
+        size_label.place(x=290, y=60)
+
+        # 推定容量
+        est = self._estimate_file_size(iw, ih, "png")
+        filesize_label = ttk.Label(dlg, text=f"推定容量: 約 {est}", foreground="gray")
+        filesize_label.place(x=20, y=100)
+
+        def update_info(*args):
+            pct = size_var.get()
+            nw = max(1, int(iw * pct / 100))
+            nh = max(1, int(ih * pct / 100))
+            size_label.config(text=f"{pct}% ({nw}x{nh})")
+            fmt_map = {"PNG": "png", "JPEG": "jpg", "GIF": "gif",
+                       "BMP": "bmp", "TIFF": "tiff", "WebP": "webp"}
+            fmt = fmt_map.get(fmt_var.get(), "png")
+            est_str = self._estimate_file_size(nw, nh, fmt)
+            filesize_label.config(text=f"推定容量: 約 {est_str}")
+
+        size_var.trace_add("write", update_info)
+        fmt_var.trace_add("write", update_info)
+
+        save_result = {"path": None}
+
+        def do_save():
+            fmt_map = {
+                "PNG": ("png", ".png"), "JPEG": ("jpg", ".jpg"),
+                "GIF": ("gif", ".gif"), "BMP": ("bmp", ".bmp"),
+                "TIFF": ("tiff", ".tiff"), "WebP": ("webp", ".webp"),
+            }
+            fmt_key, default_ext = fmt_map.get(fmt_var.get(), ("png", ".png"))
+            ft_list = [
+                ("PNG", "*.png"), ("JPEG", "*.jpg;*.jpeg"), ("GIF", "*.gif"),
+                ("BMP", "*.bmp"), ("TIFF", "*.tiff"), ("WebP", "*.webp"),
+                ("すべてのファイル", "*.*"),
             ]
-        )
-        if path:
-            self._canvas._pil_image.save(path)
-            self._status_var.set(f"保存しました: {os.path.basename(path)}")
+            path = filedialog.asksaveasfilename(
+                parent=dlg, title="画像を保存",
+                defaultextension=default_ext,
+                initialfile=f"mosaic_image{default_ext}",
+                filetypes=ft_list
+            )
+            if path:
+                save_result["path"] = path
+            dlg.destroy()
+
+        def do_cancel():
+            dlg.destroy()
+
+        ttk.Button(dlg, text="保存...", command=do_save).place(x=180, y=150)
+        ttk.Button(dlg, text="キャンセル", command=do_cancel).place(x=270, y=150)
+
+        dlg.wait_window()
+
+        path = save_result["path"]
+        if not path:
+            return
+
+        ext = os.path.splitext(path)[1].lower()
+        pct = size_var.get()
+        if pct != 100:
+            nw = max(1, int(iw * pct / 100))
+            nh = max(1, int(ih * pct / 100))
+            save_img = img.resize((nw, nh), Image.LANCZOS)
+        else:
+            save_img = img
+
+        try:
+            if ext in (".jpg", ".jpeg"):
+                if save_img.mode == "RGBA":
+                    bg = Image.new("RGB", save_img.size, (255, 255, 255))
+                    bg.paste(save_img, mask=save_img.split()[3])
+                    bg.save(path, "JPEG", quality=95)
+                else:
+                    save_img.convert("RGB").save(path, "JPEG", quality=95)
+            elif ext == ".gif":
+                if save_img.mode == "RGBA":
+                    alpha = save_img.split()[3]
+                    rgb = save_img.convert("RGB").quantize(colors=255)
+                    rgb.info["transparency"] = 255
+                    mask = Image.eval(alpha, lambda a: 255 if a <= 128 else 0)
+                    rgb.paste(255, mask=mask)
+                    rgb.save(path, "GIF", transparency=255)
+                else:
+                    save_img.convert("RGB").quantize(colors=256).save(path, "GIF")
+            elif ext == ".bmp":
+                if save_img.mode == "RGBA":
+                    bg = Image.new("RGB", save_img.size, (255, 255, 255))
+                    bg.paste(save_img, mask=save_img.split()[3])
+                    bg.save(path, "BMP")
+                else:
+                    save_img.convert("RGB").save(path, "BMP")
+            elif ext in (".tif", ".tiff"):
+                save_img.save(path, "TIFF")
+            elif ext == ".webp":
+                save_img.save(path, "WEBP", quality=95)
+            else:
+                save_img.save(path, "PNG")
+            fmt_name = ext.upper().strip('.')
+            sw, sh = save_img.size
+            self._status_var.set(
+                f"保存しました: {os.path.basename(path)} ({fmt_name}, {sw}x{sh})")
+        except Exception as e:
+            self._status_var.set(f"保存エラー: {e}")
 
     def undo(self):
         if self._canvas.undo():
