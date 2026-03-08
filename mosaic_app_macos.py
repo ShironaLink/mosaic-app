@@ -860,23 +860,53 @@ class AppDelegate(NSObject):
         if self._canvas._pil_image is None:
             return
         panel = NSSavePanel.savePanel()
-        panel.setAllowedFileTypes_(["png", "jpg", "bmp"])
+        panel.setAllowedFileTypes_(["png", "jpg", "jpeg", "gif", "bmp", "tiff", "webp"])
         panel.setNameFieldStringValue_("mosaic_image.png")
         if panel.runModal() == 1:
             url = panel.URL()
             if url:
                 path = url.path()
                 img = self._canvas._pil_image
-                # JPEG保存時はRGBに変換（透明度非対応）
                 ext = os.path.splitext(path)[1].lower()
-                if ext in (".jpg", ".jpeg", ".bmp") and img.mode == "RGBA":
-                    # 白背景で合成してRGBに変換
-                    bg = Image.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    bg.save(path)
-                else:
-                    img.save(path)
-                self._status_label.setStringValue_(f"保存しました: {os.path.basename(path)}")
+                try:
+                    if ext in (".jpg", ".jpeg"):
+                        # JPEG: RGB必須、透明度非対応
+                        if img.mode == "RGBA":
+                            bg = Image.new("RGB", img.size, (255, 255, 255))
+                            bg.paste(img, mask=img.split()[3])
+                            bg.save(path, "JPEG", quality=95)
+                        else:
+                            img.convert("RGB").save(path, "JPEG", quality=95)
+                    elif ext == ".gif":
+                        # GIF: パレットに変換、RGBA時は透明度保持
+                        if img.mode == "RGBA":
+                            alpha = img.split()[3]
+                            rgb = img.convert("RGB").quantize(colors=255)
+                            rgb.info["transparency"] = 255
+                            mask = Image.eval(alpha, lambda a: 255 if a <= 128 else 0)
+                            rgb.paste(255, mask=mask)
+                            rgb.save(path, "GIF", transparency=255)
+                        else:
+                            img.convert("RGB").quantize(colors=256).save(path, "GIF")
+                    elif ext == ".bmp":
+                        # BMP: RGB必須
+                        if img.mode == "RGBA":
+                            bg = Image.new("RGB", img.size, (255, 255, 255))
+                            bg.paste(img, mask=img.split()[3])
+                            bg.save(path, "BMP")
+                        else:
+                            img.convert("RGB").save(path, "BMP")
+                    elif ext in (".tif", ".tiff"):
+                        img.save(path, "TIFF")
+                    elif ext == ".webp":
+                        img.save(path, "WEBP", quality=95)
+                    else:
+                        # PNG（デフォルト）
+                        img.save(path, "PNG")
+                    self._status_label.setStringValue_(
+                        f"保存しました: {os.path.basename(path)} ({ext.upper().strip('.')})")
+                except Exception as e:
+                    self._status_label.setStringValue_(f"保存エラー: {e}")
 
     @objc.IBAction
     def undoAction_(self, sender):
