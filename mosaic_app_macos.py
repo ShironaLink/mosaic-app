@@ -18,6 +18,7 @@ from AppKit import (
     NSTrackingArea, NSTrackingMouseMoved, NSTrackingActiveInActiveApp,
     NSTrackingInVisibleRect, NSTrackingMouseEnteredAndExited,
     NSCursor, NSPointInRect, NSAffineTransform,
+    NSPopUpButton, NSViewMaxXMargin,
 )
 import Foundation
 from Foundation import NSObject, NSMakePoint, NSData, NSURL, NSBundle
@@ -855,58 +856,173 @@ class AppDelegate(NSObject):
             if url:
                 self.loadImageFromPath_(url.path())
 
+    def _estimate_file_size(self, width, height, fmt):
+        """フォーマットとサイズから推定ファイルサイズを計算"""
+        pixels = width * height
+        # フォーマット別の1ピクセルあたりのバイト数（目安）
+        rates = {
+            "png": 2.5, "jpg": 0.4, "gif": 0.8,
+            "bmp": 3.0, "tiff": 4.0, "webp": 0.25
+        }
+        estimated = int(pixels * rates.get(fmt, 2.5))
+        if estimated < 1024:
+            return f"{estimated} B"
+        elif estimated < 1024 * 1024:
+            return f"{estimated / 1024:.0f} KB"
+        else:
+            return f"{estimated / (1024 * 1024):.1f} MB"
+
+    def _update_save_info(self):
+        """サイズ・容量ラベルを更新"""
+        if not hasattr(self, '_save_size_label') or not self._save_size_label:
+            return
+        img = self._canvas._pil_image
+        if not img:
+            return
+        pct = int(self._save_size_slider.intValue())
+        nw = max(1, int(img.size[0] * pct / 100))
+        nh = max(1, int(img.size[1] * pct / 100))
+        self._save_size_label.setStringValue_(f"{pct}% ({nw}x{nh})")
+        # 容量の推定
+        formats = ["png", "jpg", "gif", "bmp", "tiff", "webp"]
+        idx = self._save_fmt_popup.indexOfSelectedItem()
+        fmt = formats[idx] if 0 <= idx < len(formats) else "png"
+        est = self._estimate_file_size(nw, nh, fmt)
+        self._save_filesize_label.setStringValue_(f"推定容量: 約 {est}")
+
+    def saveFormatChanged_(self, sender):
+        """フォーマット選択変更時にファイル名の拡張子を更新"""
+        if not hasattr(self, '_save_panel') or self._save_panel is None:
+            return
+        formats = ["png", "jpg", "gif", "bmp", "tiff", "webp"]
+        idx = sender.indexOfSelectedItem()
+        if 0 <= idx < len(formats):
+            ext = formats[idx]
+            current = self._save_panel.nameFieldStringValue()
+            base = os.path.splitext(current)[0] if current else "mosaic_image"
+            self._save_panel.setNameFieldStringValue_(f"{base}.{ext}")
+            self._save_panel.setAllowedFileTypes_([ext])
+        self._update_save_info()
+
+    def saveSizeChanged_(self, sender):
+        """保存サイズスライダー変更時にラベル更新"""
+        self._update_save_info()
+
     @objc.IBAction
     def saveFile_(self, sender):
         if self._canvas._pil_image is None:
             return
         panel = NSSavePanel.savePanel()
-        panel.setAllowedFileTypes_(["png", "jpg", "jpeg", "gif", "bmp", "tiff", "webp"])
+        self._save_panel = panel
+        img = self._canvas._pil_image
+        iw, ih = img.size
+
+        # フォーマット＆サイズ＆容量選択用のアクセサリビュー（3段）
+        accessory = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 400, 90))
+
+        # 上段: フォーマット選択
+        lbl_fmt = NSTextField.labelWithString_("フォーマット:")
+        lbl_fmt.setFrame_(NSMakeRect(10, 62, 80, 20))
+        accessory.addSubview_(lbl_fmt)
+
+        fmt_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(95, 60, 160, 24), False)
+        fmt_popup.addItemsWithTitles_([
+            "PNG", "JPEG", "GIF", "BMP", "TIFF", "WebP"
+        ])
+        fmt_popup.selectItemAtIndex_(0)
+        fmt_popup.setTarget_(self)
+        fmt_popup.setAction_("saveFormatChanged:")
+        accessory.addSubview_(fmt_popup)
+        self._save_fmt_popup = fmt_popup
+
+        # 中段: サイズスライダー
+        lbl_size = NSTextField.labelWithString_("サイズ:")
+        lbl_size.setFrame_(NSMakeRect(10, 34, 55, 20))
+        accessory.addSubview_(lbl_size)
+
+        size_slider = NSSlider.alloc().initWithFrame_(NSMakeRect(68, 34, 160, 20))
+        size_slider.setMinValue_(10)
+        size_slider.setMaxValue_(200)
+        size_slider.setIntValue_(100)
+        size_slider.setTarget_(self)
+        size_slider.setAction_("saveSizeChanged:")
+        accessory.addSubview_(size_slider)
+        self._save_size_slider = size_slider
+
+        self._save_size_label = NSTextField.labelWithString_(
+            f"100% ({iw}x{ih})")
+        self._save_size_label.setFrame_(NSMakeRect(235, 34, 160, 20))
+        accessory.addSubview_(self._save_size_label)
+
+        # 下段: 推定容量
+        est = self._estimate_file_size(iw, ih, "png")
+        self._save_filesize_label = NSTextField.labelWithString_(
+            f"推定容量: 約 {est}")
+        self._save_filesize_label.setFrame_(NSMakeRect(10, 8, 380, 20))
+        self._save_filesize_label.setTextColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.4, 0.4, 0.4, 1.0))
+        accessory.addSubview_(self._save_filesize_label)
+
+        panel.setAccessoryView_(accessory)
+        panel.setAllowedFileTypes_(["png"])
         panel.setNameFieldStringValue_("mosaic_image.png")
+
         if panel.runModal() == 1:
             url = panel.URL()
             if url:
                 path = url.path()
-                img = self._canvas._pil_image
                 ext = os.path.splitext(path)[1].lower()
+                # サイズ変更
+                pct = int(self._save_size_slider.intValue())
+                if pct != 100:
+                    nw = max(1, int(iw * pct / 100))
+                    nh = max(1, int(ih * pct / 100))
+                    save_img = img.resize((nw, nh), Image.LANCZOS)
+                else:
+                    save_img = img
                 try:
                     if ext in (".jpg", ".jpeg"):
-                        # JPEG: RGB必須、透明度非対応
-                        if img.mode == "RGBA":
-                            bg = Image.new("RGB", img.size, (255, 255, 255))
-                            bg.paste(img, mask=img.split()[3])
+                        if save_img.mode == "RGBA":
+                            bg = Image.new("RGB", save_img.size, (255, 255, 255))
+                            bg.paste(save_img, mask=save_img.split()[3])
                             bg.save(path, "JPEG", quality=95)
                         else:
-                            img.convert("RGB").save(path, "JPEG", quality=95)
+                            save_img.convert("RGB").save(path, "JPEG", quality=95)
                     elif ext == ".gif":
-                        # GIF: パレットに変換、RGBA時は透明度保持
-                        if img.mode == "RGBA":
-                            alpha = img.split()[3]
-                            rgb = img.convert("RGB").quantize(colors=255)
+                        if save_img.mode == "RGBA":
+                            alpha = save_img.split()[3]
+                            rgb = save_img.convert("RGB").quantize(colors=255)
                             rgb.info["transparency"] = 255
                             mask = Image.eval(alpha, lambda a: 255 if a <= 128 else 0)
                             rgb.paste(255, mask=mask)
                             rgb.save(path, "GIF", transparency=255)
                         else:
-                            img.convert("RGB").quantize(colors=256).save(path, "GIF")
+                            save_img.convert("RGB").quantize(colors=256).save(path, "GIF")
                     elif ext == ".bmp":
-                        # BMP: RGB必須
-                        if img.mode == "RGBA":
-                            bg = Image.new("RGB", img.size, (255, 255, 255))
-                            bg.paste(img, mask=img.split()[3])
+                        if save_img.mode == "RGBA":
+                            bg = Image.new("RGB", save_img.size, (255, 255, 255))
+                            bg.paste(save_img, mask=save_img.split()[3])
                             bg.save(path, "BMP")
                         else:
-                            img.convert("RGB").save(path, "BMP")
+                            save_img.convert("RGB").save(path, "BMP")
                     elif ext in (".tif", ".tiff"):
-                        img.save(path, "TIFF")
+                        save_img.save(path, "TIFF")
                     elif ext == ".webp":
-                        img.save(path, "WEBP", quality=95)
+                        save_img.save(path, "WEBP", quality=95)
                     else:
-                        # PNG（デフォルト）
-                        img.save(path, "PNG")
+                        save_img.save(path, "PNG")
+                    fmt_name = ext.upper().strip('.')
+                    sw, sh = save_img.size
                     self._status_label.setStringValue_(
-                        f"保存しました: {os.path.basename(path)} ({ext.upper().strip('.')})")
+                        f"保存しました: {os.path.basename(path)} ({fmt_name}, {sw}x{sh})")
                 except Exception as e:
                     self._status_label.setStringValue_(f"保存エラー: {e}")
+        self._save_panel = None
+        self._save_size_slider = None
+        self._save_size_label = None
+        self._save_filesize_label = None
+        self._save_fmt_popup = None
 
     @objc.IBAction
     def undoAction_(self, sender):
