@@ -44,7 +44,12 @@ pip3 install Pillow
 
 ### Windows（exe版）
 
-[Releases](../../releases) から最新版をダウンロードして、`MosaicApp.exe` を実行してください。Python のインストールは不要です。
+1. [Releases](../../releases) ページから **`MosaicApp.exe`** をダウンロード
+2. ダウンロードした `MosaicApp.exe` をダブルクリックで起動
+
+> **初回起動時の注意**: Windows Defender SmartScreen が警告を表示する場合は、「詳細情報」→「実行」をクリックしてください。
+
+Python のインストールは不要です。
 
 ### Python から実行（開発者向け）
 
