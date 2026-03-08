@@ -71,6 +71,10 @@ class MosaicCanvasView(NSView):
         # トリミング選択範囲（画像ピクセル座標で保持）
         self._crop_selection = None          # (x0, y0, x1, y1) or None
         self._crop_mode_for_selection = None # "crop_rect" or "crop_circle"
+        # 選択範囲の移動用
+        self._is_moving_selection = False
+        self._move_start_ix = 0
+        self._move_start_iy = 0
         # ブラシプレビュー用マウス位置
         self._mouse_x = -1000.0
         self._mouse_y = -1000.0
@@ -273,6 +277,13 @@ class MosaicCanvasView(NSView):
         if self._mode == "brush":
             self.setNeedsDisplay_(True)
 
+    def _is_point_in_crop_selection(self, ix, iy):
+        """画像座標がクロップ選択内かどうか"""
+        if self._crop_selection is None:
+            return False
+        sx0, sy0, sx1, sy1 = self._crop_selection
+        return sx0 <= ix <= sx1 and sy0 <= iy <= sy1
+
     def mouseDown_(self, event):
         if self._pil_image is None:
             return
@@ -280,9 +291,19 @@ class MosaicCanvasView(NSView):
         vx, vy = loc.x, loc.y
 
         if self._mode in ("rect", "crop_rect", "crop_circle"):
+            if self._mode in ("crop_rect", "crop_circle") and self._crop_selection:
+                # 既存の選択範囲内をクリック → 移動モード
+                ix, iy = self._view_to_image(vx, vy)
+                if self._is_point_in_crop_selection(ix, iy):
+                    self._is_moving_selection = True
+                    self._move_start_ix = ix
+                    self._move_start_iy = iy
+                    return
             # 新しいドラッグで古いクロップ選択をクリア
             if self._mode in ("crop_rect", "crop_circle"):
                 self._crop_selection = None
+                if self._delegate and hasattr(self._delegate, '_update_crop_button'):
+                    self._delegate._update_crop_button()
             self._drag_start = (vx, vy)
             self._drag_current = (vx, vy)
         else:
@@ -298,6 +319,28 @@ class MosaicCanvasView(NSView):
         # ブラシプレビュー位置も更新
         self._mouse_x = vx
         self._mouse_y = vy
+
+        if self._is_moving_selection and self._crop_selection:
+            # 選択範囲を移動
+            ix, iy = self._view_to_image(vx, vy)
+            dx = ix - self._move_start_ix
+            dy = iy - self._move_start_iy
+            sx0, sy0, sx1, sy1 = self._crop_selection
+            iw, ih = self._pil_image.size
+            sw, sh = sx1 - sx0, sy1 - sy0
+            # 画像範囲内にクランプ
+            nx0 = max(0, min(iw - sw, sx0 + dx))
+            ny0 = max(0, min(ih - sh, sy0 + dy))
+            self._crop_selection = (nx0, ny0, nx0 + sw, ny0 + sh)
+            self._move_start_ix = ix
+            self._move_start_iy = iy
+            # ステータス更新
+            if self._delegate and hasattr(self._delegate, '_status_label'):
+                mode_name = "□" if self._crop_mode_for_selection == "crop_rect" else "○"
+                self._delegate._status_label.setStringValue_(
+                    f"{mode_name} 移動中: {sw} x {sh}  |  「切り取り」ボタンで実行")
+            self.setNeedsDisplay_(True)
+            return
 
         if self._mode in ("rect", "crop_rect", "crop_circle"):
             # Ctrl押しで正方形/正円に制約
@@ -316,6 +359,16 @@ class MosaicCanvasView(NSView):
 
     def mouseUp_(self, event):
         if self._pil_image is None:
+            return
+        # 移動モード終了
+        if self._is_moving_selection:
+            self._is_moving_selection = False
+            if self._crop_selection and self._delegate and hasattr(self._delegate, '_status_label'):
+                sx0, sy0, sx1, sy1 = self._crop_selection
+                w, h = sx1 - sx0, sy1 - sy0
+                mode_name = "□" if self._crop_mode_for_selection == "crop_rect" else "○"
+                self._delegate._status_label.setStringValue_(
+                    f"{mode_name} 選択中: {w} x {h}  |  「切り取り」ボタンで実行")
             return
         if self._mode in ("rect", "crop_rect", "crop_circle") and self._drag_start and self._drag_current:
             ix0, iy0 = self._view_to_image(*self._drag_start)
