@@ -68,6 +68,9 @@ class MosaicCanvasView(NSView):
         self._pan_start_y = 0.0
         self._pan_offset_start_x = 0.0
         self._pan_offset_start_y = 0.0
+        # トリミング選択範囲（画像ピクセル座標で保持）
+        self._crop_selection = None          # (x0, y0, x1, y1) or None
+        self._crop_mode_for_selection = None # "crop_rect" or "crop_circle"
         # ブラシプレビュー用マウス位置
         self._mouse_x = -1000.0
         self._mouse_y = -1000.0
@@ -165,7 +168,7 @@ class MosaicCanvasView(NSView):
             )
             NSGraphicsContext.currentContext().restoreGraphicsState()
 
-            # 範囲選択中のプレビュー描画
+            # 範囲選択中のプレビュー描画（ドラッグ中）
             if self._drag_start and self._drag_current:
                 x0, y0 = self._drag_start
                 x1, y1 = self._drag_current
@@ -175,7 +178,6 @@ class MosaicCanvasView(NSView):
                 rh = abs(y1 - y0)
 
                 if self._mode == "crop_circle":
-                    # 円形トリミングプレビュー（シアン色の楕円）
                     NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.8, 1.0, 0.8).set()
                     path = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(rx, ry, rw, rh))
                     path.setLineWidth_(2.0)
@@ -183,13 +185,37 @@ class MosaicCanvasView(NSView):
                     path.setLineDash_count_phase_(pattern, 2, 0)
                     path.stroke()
                 elif self._mode in ("rect", "crop_rect"):
-                    # 矩形プレビュー
                     if self._mode == "crop_rect":
                         NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 1.0, 0.3, 0.8).set()
                     else:
                         NSColor.redColor().set()
                     path = NSBezierPath.bezierPathWithRect_(NSMakeRect(rx, ry, rw, rh))
                     path.setLineWidth_(2.0)
+                    pattern = [4.0, 4.0]
+                    path.setLineDash_count_phase_(pattern, 2, 0)
+                    path.stroke()
+
+            # 確定済みクロップ選択の描画（ドラッグ終了後）
+            if self._crop_selection and not self._drag_start:
+                sx0, sy0, sx1, sy1 = self._crop_selection
+                vx0, vy0 = self._image_to_view(sx0, sy0)
+                vx1, vy1 = self._image_to_view(sx1, sy1)
+                rx = min(vx0, vx1)
+                ry = min(vy0, vy1)
+                rw = abs(vx1 - vx0)
+                rh = abs(vy1 - vy0)
+
+                if self._crop_mode_for_selection == "crop_circle":
+                    NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.8, 1.0, 0.9).set()
+                    path = NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(rx, ry, rw, rh))
+                    path.setLineWidth_(2.5)
+                    pattern = [6.0, 4.0]
+                    path.setLineDash_count_phase_(pattern, 2, 0)
+                    path.stroke()
+                else:
+                    NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 1.0, 0.3, 0.9).set()
+                    path = NSBezierPath.bezierPathWithRect_(NSMakeRect(rx, ry, rw, rh))
+                    path.setLineWidth_(2.5)
                     pattern = [4.0, 4.0]
                     path.setLineDash_count_phase_(pattern, 2, 0)
                     path.stroke()
@@ -222,6 +248,13 @@ class MosaicCanvasView(NSView):
         iy = int((vy - img_rect.origin.y) / scale)
         return ix, iy
 
+    def _image_to_view(self, ix, iy):
+        """画像ピクセル座標 → ビュー座標"""
+        img_rect, scale = self._image_rect()
+        vx = ix * scale + img_rect.origin.x
+        vy = iy * scale + img_rect.origin.y
+        return vx, vy
+
     def mouseMoved_(self, event):
         """マウス移動時にブラシプレビュー更新"""
         loc = self.convertPoint_fromView_(event.locationInWindow(), None)
@@ -247,6 +280,9 @@ class MosaicCanvasView(NSView):
         vx, vy = loc.x, loc.y
 
         if self._mode in ("rect", "crop_rect", "crop_circle"):
+            # 新しいドラッグで古いクロップ選択をクリア
+            if self._mode in ("crop_rect", "crop_circle"):
+                self._crop_selection = None
             self._drag_start = (vx, vy)
             self._drag_current = (vx, vy)
         else:
@@ -264,6 +300,14 @@ class MosaicCanvasView(NSView):
         self._mouse_y = vy
 
         if self._mode in ("rect", "crop_rect", "crop_circle"):
+            # Ctrl押しで正方形/正円に制約
+            if self._drag_start and (event.modifierFlags() & (1 << 18)):
+                sx, sy = self._drag_start
+                dx = vx - sx
+                dy = vy - sy
+                size = max(abs(dx), abs(dy))
+                vx = sx + (size if dx >= 0 else -size)
+                vy = sy + (size if dy >= 0 else -size)
             self._drag_current = (vx, vy)
             self.setNeedsDisplay_(True)
         else:
@@ -273,20 +317,27 @@ class MosaicCanvasView(NSView):
     def mouseUp_(self, event):
         if self._pil_image is None:
             return
-        if self._mode in ("rect", "crop_rect", "crop_circle") and self._drag_start:
-            loc = self.convertPoint_fromView_(event.locationInWindow(), None)
+        if self._mode in ("rect", "crop_rect", "crop_circle") and self._drag_start and self._drag_current:
             ix0, iy0 = self._view_to_image(*self._drag_start)
-            ix1, iy1 = self._view_to_image(loc.x, loc.y)
+            ix1, iy1 = self._view_to_image(*self._drag_current)
             lx, rx = min(ix0, ix1), max(ix0, ix1)
             ly, ry = min(iy0, iy1), max(iy0, iy1)
             if rx - lx > 2 and ry - ly > 2:
-                self._push_undo()
                 if self._mode == "rect":
+                    # モザイクは即時適用
+                    self._push_undo()
                     self._apply_mosaic(lx, ly, rx, ry)
-                elif self._mode == "crop_rect":
-                    self._apply_rect_crop(lx, ly, rx, ry)
-                elif self._mode == "crop_circle":
-                    self._apply_circle_crop(lx, ly, rx, ry)
+                elif self._mode in ("crop_rect", "crop_circle"):
+                    # トリミングは選択のみ保持（「切り取り」ボタンで実行）
+                    self._crop_selection = (lx, ly, rx, ry)
+                    self._crop_mode_for_selection = self._mode
+                    w, h = rx - lx, ry - ly
+                    if self._delegate and hasattr(self._delegate, '_status_label'):
+                        mode_name = "□" if self._mode == "crop_rect" else "○"
+                        self._delegate._status_label.setStringValue_(
+                            f"{mode_name} 選択中: {w} x {h}  |  「切り取り」ボタンで実行")
+                    if self._delegate and hasattr(self._delegate, '_update_crop_button'):
+                        self._delegate._update_crop_button()
             self._drag_start = None
             self._drag_current = None
             self.setNeedsDisplay_(True)
@@ -408,6 +459,27 @@ class MosaicCanvasView(NSView):
         half = max(5, self._brush_size) // 2
         self._apply_mosaic(cx - half, cy - half, cx + half, cy + half)
 
+    def applyCrop(self):
+        """保持されたクロップ選択を実行"""
+        if self._crop_selection is None:
+            return False
+        x0, y0, x1, y1 = self._crop_selection
+        mode = self._crop_mode_for_selection
+        self._push_undo()
+        if mode == "crop_rect":
+            self._apply_rect_crop(x0, y0, x1, y1)
+        elif mode == "crop_circle":
+            self._apply_circle_crop(x0, y0, x1, y1)
+        self._crop_selection = None
+        self._crop_mode_for_selection = None
+        return True
+
+    def clearCropSelection(self):
+        """クロップ選択をクリア"""
+        self._crop_selection = None
+        self._crop_mode_for_selection = None
+        self.setNeedsDisplay_(True)
+
     def _apply_rect_crop(self, x0, y0, x1, y1):
         """四角トリミング"""
         iw, ih = self._pil_image.size
@@ -490,6 +562,7 @@ class AppDelegate(NSObject):
         self._mode_rect_btn = None
         self._mode_crop_rect_btn = None
         self._mode_crop_circle_btn = None
+        self._btn_crop = None
         return self
 
     def applicationDidFinishLaunching_(self, notification):
@@ -676,6 +749,16 @@ class AppDelegate(NSObject):
         self._brush_label = NSTextField.labelWithString_("30px")
         self._brush_label.setFrame_(NSMakeRect(x, row2_y + 5, 40, 20))
         toolbar.addSubview_(self._brush_label)
+        x += 55
+
+        # 切り取りボタン
+        self._btn_crop = NSButton.alloc().initWithFrame_(NSMakeRect(x, row2_y, 80, 30))
+        self._btn_crop.setTitle_("切り取り")
+        self._btn_crop.setBezelStyle_(NSBezelStyleRounded)
+        self._btn_crop.setTarget_(self)
+        self._btn_crop.setAction_("cropAction:")
+        self._btn_crop.setEnabled_(False)
+        toolbar.addSubview_(self._btn_crop)
 
         content.addSubview_(toolbar)
 
@@ -759,14 +842,18 @@ class AppDelegate(NSObject):
     @objc.IBAction
     def setModeBrush_(self, sender):
         self._canvas._mode = "brush"
+        self._canvas.clearCropSelection()
         self._set_all_mode_buttons_off()
         self._mode_brush_btn.setState_(NSOnState)
+        self._update_crop_button()
 
     @objc.IBAction
     def setModeRect_(self, sender):
         self._canvas._mode = "rect"
+        self._canvas.clearCropSelection()
         self._set_all_mode_buttons_off()
         self._mode_rect_btn.setState_(NSOnState)
+        self._update_crop_button()
 
     @objc.IBAction
     def setModeCropRect_(self, sender):
@@ -779,6 +866,20 @@ class AppDelegate(NSObject):
         self._canvas._mode = "crop_circle"
         self._set_all_mode_buttons_off()
         self._mode_crop_circle_btn.setState_(NSOnState)
+
+    @objc.IBAction
+    def cropAction_(self, sender):
+        """切り取りボタン: 保持されたクロップ選択を実行"""
+        if self._canvas and self._canvas.applyCrop():
+            self._update_crop_button()
+        else:
+            self._status_label.setStringValue_("トリミング範囲が選択されていません")
+
+    def _update_crop_button(self):
+        """切り取りボタンの有効/無効を更新"""
+        if self._btn_crop:
+            enabled = self._canvas._crop_selection is not None
+            self._btn_crop.setEnabled_(enabled)
 
     @objc.IBAction
     def blockSizeChanged_(self, sender):
