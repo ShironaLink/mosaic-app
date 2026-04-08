@@ -3,7 +3,7 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog, colorchooser
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageChops
 import os
 import sys
 
@@ -28,6 +28,7 @@ class MosaicCanvas(tk.Canvas):
         self._block_size = 15
         self._brush_size = 30
         self._paint_color = (0, 0, 0)  # ペイント色 (RGB)
+        self._tolerance = 30  # 透過の色許容範囲
         self._zoom_scale = 1.0
         self._pan_offset_x = 0.0
         self._pan_offset_y = 0.0
@@ -105,6 +106,18 @@ class MosaicCanvas(tk.Canvas):
         y = (ch - nh) / 2.0 + self._pan_offset_y
         return x, y, nw, nh, effective_scale
 
+    @staticmethod
+    def _make_checker(w, h, cell=8):
+        """透過部分を示すチェッカーボード背景を生成"""
+        checker = Image.new("RGB", (w, h), (200, 200, 200))
+        draw = ImageDraw.Draw(checker)
+        for cy in range(0, h, cell):
+            for cx in range(0, w, cell):
+                if (cx // cell + cy // cell) % 2 == 0:
+                    draw.rectangle([cx, cy, cx + cell - 1, cy + cell - 1],
+                                   fill=(255, 255, 255))
+        return checker
+
     def _update_display(self):
         if self._pil_image is None:
             return
@@ -113,6 +126,11 @@ class MosaicCanvas(tk.Canvas):
         disp_w = max(1, int(nw))
         disp_h = max(1, int(nh))
         display_img = self._pil_image.resize((disp_w, disp_h), Image.NEAREST)
+        # RGBA画像はチェッカーボード上に合成して透過を可視化
+        if display_img.mode == "RGBA":
+            checker = self._make_checker(disp_w, disp_h)
+            checker.paste(display_img, mask=display_img.split()[3])
+            display_img = checker
         self._photo_image = ImageTk.PhotoImage(display_img)
         self.create_image(x, y, image=self._photo_image, anchor=tk.NW, tags="image")
         # クロップ選択があれば再描画
@@ -164,6 +182,9 @@ class MosaicCanvas(tk.Canvas):
         elif mode == "paint":
             self._push_undo()
             self._apply_paint_brush(ix, iy)
+        elif mode == "transparent":
+            self._push_undo()
+            self._apply_transparent(ix, iy)
 
     def _on_mouse_drag(self, event):
         if self._pil_image is None:
@@ -428,6 +449,39 @@ class MosaicCanvas(tk.Canvas):
         )
         self._update_display()
 
+    def _apply_transparent(self, cx, cy):
+        """クリックした色と近い色を透過にする（Pillow演算で高速処理）"""
+        if self._pil_image is None:
+            return
+        iw, ih = self._pil_image.size
+        if cx < 0 or cy < 0 or cx >= iw or cy >= ih:
+            return
+        # Ensure RGBA
+        if self._pil_image.mode != "RGBA":
+            self._pil_image = self._pil_image.convert("RGBA")
+        target = self._pil_image.getpixel((cx, cy))[:3]
+        tol = self._tolerance
+        r, g, b, a = self._pil_image.split()
+        tr, tg, tb = target
+        # Difference per channel, then threshold
+        diff_r = ImageChops.difference(r, Image.new("L", (iw, ih), tr))
+        diff_g = ImageChops.difference(g, Image.new("L", (iw, ih), tg))
+        diff_b = ImageChops.difference(b, Image.new("L", (iw, ih), tb))
+        # Pixels within tolerance -> 255 (match), else 0
+        mask_r = diff_r.point(lambda v: 255 if v <= tol else 0)
+        mask_g = diff_g.point(lambda v: 255 if v <= tol else 0)
+        mask_b = diff_b.point(lambda v: 255 if v <= tol else 0)
+        # Combine: all three must match
+        match_mask = ImageChops.multiply(ImageChops.multiply(mask_r, mask_g), mask_b)
+        # Invert match_mask: matched pixels become 0 (transparent)
+        inv_mask = match_mask.point(lambda v: 0 if v == 255 else 255)
+        # Apply: keep existing alpha but set matched pixels to 0
+        new_alpha = ImageChops.multiply(a, inv_mask)
+        self._pil_image = Image.merge("RGBA", (r, g, b, new_alpha))
+        self._update_display()
+        self._app._status_var.set(
+            f"RGB({tr}, {tg}, {tb}) 許容値±{tol} を透過しました")
+
     # --- トリミング ---
 
     def apply_crop(self):
@@ -577,6 +631,9 @@ class MosaicApp(tk.Tk):
         ttk.Radiobutton(
             toolbar, text="○トリミング", variable=self._mode_var, value="crop_circle"
         ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            toolbar, text="透過", variable=self._mode_var, value="transparent"
+        ).pack(side=tk.LEFT)
 
         self._btn_crop = ttk.Button(toolbar, text="切り取り", command=self._do_crop,
                                      state=tk.DISABLED)
@@ -616,6 +673,16 @@ class MosaicApp(tk.Tk):
             command=self._on_brush_changed
         ).pack(side=tk.LEFT)
         self._brush_label.pack(side=tk.LEFT, padx=(2, 4))
+
+        ttk.Label(toolbar, text="許容値:").pack(side=tk.LEFT, padx=(4, 2))
+        self._tolerance_var = tk.IntVar(value=30)
+        self._tolerance_label = ttk.Label(toolbar, text="30", width=4)
+        ttk.Scale(
+            toolbar, from_=0, to=128, variable=self._tolerance_var,
+            orient=tk.HORIZONTAL, length=100,
+            command=self._on_tolerance_changed
+        ).pack(side=tk.LEFT)
+        self._tolerance_label.pack(side=tk.LEFT, padx=(2, 4))
 
     def _setup_canvas(self):
         self._canvas = MosaicCanvas(self, app=self)
@@ -669,6 +736,7 @@ class MosaicApp(tk.Tk):
             "paint": "circle",
             "crop_rect": "crosshair",
             "crop_circle": "crosshair",
+            "transparent": "tcross",
         }
         self._canvas.configure(cursor=cursors.get(mode, "arrow"))
         # トリミング以外のモードに切り替えたらクロップ選択をクリア
@@ -708,6 +776,11 @@ class MosaicApp(tk.Tk):
         """スポイトで色を取得した際にステータスバーに表示"""
         hex_color = "#{:02x}{:02x}{:02x}".format(*rgb)
         self._status_var.set(f"色を取得: RGB({rgb[0]}, {rgb[1]}, {rgb[2]})  {hex_color}")
+
+    def _on_tolerance_changed(self, value):
+        val = int(float(value))
+        self._canvas._tolerance = val
+        self._tolerance_label.config(text=f"{val}")
 
     def _on_block_changed(self, value):
         val = int(float(value))
@@ -898,7 +971,8 @@ class MosaicApp(tk.Tk):
         try:
             img = Image.open(path)
             img.load()
-            img = img.convert("RGB")
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGBA") if img.mode in ("LA", "PA", "P") else img.convert("RGB")
         except Exception as e:
             self._status_var.set(f"画像を開けません: {e}")
             return

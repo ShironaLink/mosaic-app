@@ -1,3 +1,3 @@
 @echo off
 cd /d "%~dp0"
-py mosaic_app.py %*
+call venv\Scripts\python.exe mosaic_app.py %*
